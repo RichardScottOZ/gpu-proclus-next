@@ -1,6 +1,10 @@
 # gpu-proclus-next
 An experiment in bigger K
 
+## GPU_PROCLUS
+- You will need to build this to get it to work
+    - A Windows 11 variant - you would need to change for linux targets
+
 
 A clean, scalable CUDA core for projected k‑medoids (PROCLUS/GPU‑FAST‑PROCLUS) that:
 - assigns 6.48M × 85 features with k=1000 on a 16 GB Tesla
