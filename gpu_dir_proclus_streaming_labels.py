@@ -534,45 +534,21 @@ def main():
         means = np.zeros(B, dtype=np.float32)
         stds  = np.ones(B, dtype=np.float32)
 
-    # ---- FIT PHASE ----
+    # ---- FIT PHASE (patched) ----
     k, l = args.k, args.l
-    M_np: Optional[np.ndarray] = None        # medoid feature vectors (k,d) float32
-    D_np: Optional[np.ndarray] = None        # (k,d) bool
-    excl_np: Optional[np.ndarray] = None     # (k,) int32 (when l == d-1)
+    M_np: Optional[np.ndarray] = None  # medoid feature vectors (k,d) float32
+    D_np: Optional[np.ndarray] = None  # (k,d) bool
+    excl_np: Optional[np.ndarray] = None  # (k,) int32 (when l == d-1)
 
-    if args.fit_mode in ("full", "sample"):
-        # Import PROCLUS callable
-        #proclus_map = import_proclus(Path(args.proclus_repo))
-        ####proclus_map = import_proclus(Path(args.proclus_repo), verbose=args.verbose)
-        if args.labels_runtime:
-            # Python labels-only FIT path (memory-safe for large k)
-            if fit_proclus_labels_py is None:
-                raise RuntimeError("Could not import proclus_labels. Ensure proclus_labels.py is in parent directory.")
-            print(f"[FIT][labels_runtime] k={k} l={l} b={args.b} (Python labels-only, no O(n*k) memory)")
-            M_indices, D_mask_t = fit_proclus_labels_py(
-                X, k, l, args.a, args.b, args.min_deviation, args.termination_rounds,
-                seed=args.seed, tile_n=131072
-            )
-            # Extract medoid feature vectors from indices
-            M_np = X[M_indices].cpu().numpy().astype("float32")
-            D_np = D_mask_t.cpu().numpy().astype("bool")
-            excl_np = excl_from_dims_if_l_eq_d_minus_1(
-                [D_mask_t[i].nonzero(as_tuple=True)[0] for i in range(k)],
-                d=M_np.shape[1], l=l
-            )
-        else:
-            # Original CUDA PROCLUS path
-            proclus_map = import_proclus(Path(args.proclus_repo), verbose=args.verbose)
-
-
-        proclus_fn = proclus_map[args.variant]
-
-        # Build fit matrix X_fit
+    def _build_X_for_fit(paths, H, W, B, means, stds, args):
+        """
+        Build the FIT matrix X as torch.float32 CUDA tensor [n, d].
+        Reuses your existing 'full' and 'sample' logic.
+        """
         if args.fit_mode == "full":
-            # Build full feature matrix on CPU (like the non-streaming workflow), then H2D
-            X_cpu = np.empty((N, B), dtype=np.float32)
-            valid_mask = np.ones(N, dtype=bool)
-
+            # Build full feature matrix on CPU (like non-streaming), then H2D
+            X_cpu = np.empty((H * W, B), dtype=np.float32)
+            valid_mask = np.ones(H * W, dtype=bool)
             dsets = [rio.open(p) for p in paths]
             try:
                 nodatas = [ds.nodata for ds in dsets]
@@ -594,44 +570,72 @@ def main():
                     mask = masks[0].copy()
                     for m in masks[1:]:
                         mask |= m
-
                     if args.standardize:
                         Xb_valid = Xb[~mask]
                         if Xb_valid.shape[0] > 0:
                             Xb[~mask] = (Xb_valid - means) / stds
-
-                    X_cpu[base:base + h*W, :] = Xb
-                    valid_mask[base:base + h*W] = ~mask
-                    base += h*W
+                    X_cpu[base:base + h * W, :] = Xb
+                    valid_mask[base:base + h * W] = ~mask
+                    base += h * W
             finally:
                 for ds in dsets:
                     ds.close()
-
-            # Move to GPU
             X = torch.from_numpy(X_cpu).pin_memory().to(device="cuda", dtype=torch.float32, non_blocking=True)
+            return X
 
-        else:  # sample
-            X_sample = reservoir_sample_per_tile(paths, H, W, args.tile_rows,
-                                                 means, stds, args.standardize,
-                                                 args.max_fit_pixels, args.seed)
-            print(f"[Fit] Sampled {X_sample.shape[0]:,} valid pixels for fitting.")
-            X = torch.from_numpy(X_sample).to(device="cuda", dtype=torch.float32, non_blocking=False)
+        # Sampled fit matrix
+        X_sample = reservoir_sample_per_tile(paths, H, W, args.tile_rows,
+                                            means, stds, args.standardize,
+                                            args.max_fit_pixels, args.seed)
+        print(f"[Fit] Sampled {X_sample.shape[0]:,} valid pixels for fitting.")
+        X = torch.from_numpy(X_sample).to(device="cuda", dtype=torch.float32, non_blocking=False)
+        return X
 
-        # Compute candidate pool size
-        if 1 == 2: ## old not needed
+
+    if args.fit_mode in ("full", "sample"):
+        # 1) Build X for BOTH labels_runtime and CUDA paths
+        X = _build_X_for_fit(paths, H, W, B, means, stds, args)
+
+        # 2) Branch: labels-only Python FIT vs CUDA PROCLUS
+        if args.labels_runtime:
+            # Python labels-only FIT path (memory-safe for large k)
+            if fit_proclus_labels_py is None:
+                raise RuntimeError("Could not import proclus_labels. Ensure proclus_labels.py is in parent directory.")
+            print(f"[FIT][labels_runtime] k={k} l={l} b={args.b} (Python labels-only, no O(n*k) memory)")
+
+            M_indices, D_mask_t = fit_proclus_labels_py(
+                X, k, l, args.a, args.b, args.min_deviation, args.termination_rounds,
+                seed=args.seed, tile_n=131072
+            )
+
+            # Extract medoid feature vectors and D-mask
+            M_np = X[M_indices].detach().cpu().numpy().astype("float32", copy=False)
+            D_np = D_mask_t.detach().cpu().numpy().astype("bool", copy=False)
+
+            # Try to build excl if l == d-1
+            excl_np = excl_from_dims_if_l_eq_d_minus_1(
+                [D_mask_t[i].nonzero(as_tuple=True)[0] for i in range(k)],
+                d=M_np.shape[1], l=l
+            )
+
+        else:
+            # Original CUDA/compiled PROCLUS path
+            proclus_map = import_proclus(Path(args.proclus_repo), verbose=args.verbose)
+            proclus_fn = proclus_map[args.variant]
+
+            # Candidate pool size 'a' (fixes previously undefined variable)
             a = min(100, X.shape[0] // k) if args.a == 0 else args.a
-            print(f"[PROCLUS][{args.variant}] k={k} l={l} a={a} b={args.b} "
-                f"min_dev={args.min_deviation} term_rounds={args.termination_rounds}")
+            print(
+                f"[PROCLUS][{args.variant}] k={k} l={l} a={a} b={args.b} "
+                f"min_dev={args.min_deviation} term_rounds={args.termination_rounds}"
+            )
 
             # Run PROCLUS
             out = proclus_fn(X, k, l, a, args.b, args.min_deviation, args.termination_rounds)
-
             labels_fit, medoids_idx, cluster_dims = parse_proclus_return(out, X.shape[0], k)
 
             # Derive medoid vectors
             if medoids_idx is None:
-                # Fallback: if the algorithm returned medoid vectors directly somewhere in 'out',
-                # try to pick a (k,d) float32 tensor/array.
                 candidates = [x for x in _flatten(out)
                             if (torch.is_tensor(x) or isinstance(x, np.ndarray))
                             and getattr(x, "ndim", 0) == 2
@@ -639,55 +643,59 @@ def main():
                 if len(candidates) > 0:
                     M_np = (candidates[0].detach().cpu().numpy()
                             if torch.is_tensor(candidates[0]) else candidates[0]).astype(np.float32, copy=False)
+                else:
+                    raise RuntimeError("Could not recover medoid feature vectors (k,d) from PROCLUS output.")
             else:
                 idx = _to_numpy1d_int(medoids_idx)
                 X_cpu_for_m = X.detach().cpu().numpy().astype(np.float32, copy=False)
                 M_np = X_cpu_for_m[idx]
 
-            if M_np is None:
-                raise RuntimeError("Could not recover medoid feature vectors (k,d) from PROCLUS output.")
-
-            # Build projector (prefer D mask; use excl only if exact condition)
+            # Build projector (prefer D mask; excl only when exactly l == d-1)
             if cluster_dims is not None:
                 D_np = projector_from_cluster_dims(cluster_dims, d=M_np.shape[1], l=l)
                 excl_np = excl_from_dims_if_l_eq_d_minus_1(cluster_dims, d=M_np.shape[1], l=l)
             else:
-                # No dims returned -> default to "no projection" (use all dims) as a safe fallback
                 D_np = np.ones((k, M_np.shape[1]), dtype=bool)
                 excl_np = None
 
-        # Save artifacts if requested
-        if args.fit_artifacts_out:
-            payload = {
-                "variant": args.variant,
-                "params": {
-                    "k": int(k), "l": int(l), "a": int(a), "b": int(args.b),
-                    "min_deviation": float(args.min_deviation),
-                    "termination_rounds": int(args.termination_rounds)
-                },
-                "bands": [str(p) for p in paths],
-                "grid": {"H": int(H), "W": int(W), "B": int(B)},
-                "medoids": M_np.tolist(),
-                "D_mask": D_np.astype(bool).tolist() if D_np is not None else [],
-                "excl": excl_np.astype(int).tolist() if excl_np is not None else []
-            }
-            Path(args.fit_artifacts_out).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.fit_artifacts_out).write_text(json.dumps(payload, indent=2))
-            print(f"[Artifacts] Saved fit artifacts -> {args.fit_artifacts_out}")
+            # Save artifacts if requested
+            if args.fit_artifacts_out:
+                payload = {
+                    "variant": args.variant,
+                    "params": {
+                        "k": int(k), "l": int(l), "a": int(a), "b": int(args.b),
+                        "min_deviation": float(args.min_deviation),
+                        "termination_rounds": int(args.termination_rounds)
+                    },
+                    "bands": [str(p) for p in paths],
+                    "grid": {"H": int(H), "W": int(W), "B": int(B)},
+                    "medoids": M_np.tolist(),
+                    "D_mask": D_np.astype(bool).tolist() if D_np is not None else [],
+                    "excl": excl_np.astype(int).tolist() if excl_np is not None else []
+                }
+                Path(args.fit_artifacts_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.fit_artifacts_out).write_text(json.dumps(payload, indent=2))
+                print(f"[Artifacts] Saved fit artifacts -> {args.fit_artifacts_out}")
 
     elif args.fit_mode == "artifacts":
         if not args.fit_artifacts_in:
             raise ValueError("--fit_artifacts_in is required when fit_mode=artifacts")
         payload = json.loads(Path(args.fit_artifacts_in).read_text())
-        M_np   = np.asarray(payload["medoids"], dtype=np.float32)
+        M_np = np.asarray(payload["medoids"], dtype=np.float32)
         D_list = payload.get("D_mask", [])
         excl_list = payload.get("excl", [])
-        D_np   = np.asarray(D_list, dtype=bool) if len(D_list) > 0 else None
+        D_np = np.asarray(D_list, dtype=bool) if len(D_list) > 0 else None
         excl_np = np.asarray(excl_list, dtype=np.int32) if len(excl_list) > 0 else None
-        print(f"[Artifacts] Loaded medoids (k={M_np.shape[0]}, d={M_np.shape[1]}). "
-              f"D_mask={'yes' if D_np is not None else 'no'}, excl={'yes' if excl_np is not None else 'no'}")
+        print(
+            f"[Artifacts] Loaded medoids (k={M_np.shape[0]}, d={M_np.shape[1]}). "
+            f"D_mask={'yes' if D_np is not None else 'no'}, excl={'yes' if excl_np is not None else 'no'}"
+        )
     else:
         raise ValueError(f"Unknown fit_mode: {args.fit_mode}")
+
+    # Guards before ASSIGN
+    if M_np is None:
+        raise RuntimeError("Medoids array (M_np) is None after FIT; check FIT path.")
 
     # ---- ASSIGN (STREAM) PHASE ----
     # Decide assignment mode
